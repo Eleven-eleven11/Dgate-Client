@@ -1,0 +1,1328 @@
+# dragons_gate_client.py
+# Enhanced with Variables, Conditionals, and Script Sequences
+
+import sys
+import re
+import asyncio
+import json
+from PySide6.QtWidgets import *
+from PySide6.QtCore import *
+from PySide6.QtGui import *
+import qasync
+
+
+def ansi_to_html(text: str) -> str:
+    text = re.sub(r'\x1b\[0?m', '</span>', text)
+    text = re.sub(r'\x1b\[31m', '<span style="color:#ff5555">', text)
+    text = re.sub(r'\x1b\[32m', '<span style="color:#55ff55">', text)
+    text = re.sub(r'\x1b\[33m', '<span style="color:#ffff55">', text)
+    text = re.sub(r'\x1b\[1m', '<span style="font-weight:bold">', text)
+    text = text.replace('\r\n', '<br>').replace('\n', '<br>')
+    return text
+
+
+class ScriptEngine:
+    """Enhanced scripting engine with variables, conditionals, and sequences"""
+    
+    def __init__(self, parent):
+        self.parent = parent
+        self.variables = {}
+        self.sequences = {}
+        self.running_sequences = []
+        
+    def set_variable(self, name, value):
+        """Set a variable value"""
+        self.variables[name] = value
+        
+    def get_variable(self, name, default=""):
+        """Get a variable value"""
+        return self.variables.get(name, default)
+    
+    def expand_variables(self, text):
+        """Replace $varname and ${varname} with values"""
+        # Handle ${varname} syntax
+        text = re.sub(r'\$\{(\w+)\}', lambda m: str(self.get_variable(m.group(1))), text)
+        # Handle $varname syntax (word boundary)
+        text = re.sub(r'\$(\w+)', lambda m: str(self.get_variable(m.group(1))), text)
+        return text
+    
+    def evaluate_condition(self, condition):
+        """Evaluate a simple condition like: $hp < 50, $target == orc"""
+        try:
+            # Expand variables in condition
+            condition = self.expand_variables(condition)
+            
+            # Support for game state variables
+            condition = condition.replace('@hp', str(self.parent.hp))
+            condition = condition.replace('@hp_max', str(self.parent.hp_max))
+            condition = condition.replace('@fatigue', str(self.parent.fatigue))
+            condition = condition.replace('@fatigue_max', str(self.parent.fatigue_max))
+            condition = condition.replace('@carry', str(self.parent.carry))
+            
+            # Evaluate the condition safely (limited eval)
+            # Convert common operators
+            result = eval(condition, {"__builtins__": {}}, {})
+            return bool(result)
+        except:
+            return False
+    
+    async def execute_command(self, command):
+        """Execute a single command with variable expansion and conditionals"""
+        command = command.strip()
+        
+        if not command or command.startswith('#'):
+            return
+        
+        # Handle IF statements: if condition then action
+        if_match = re.match(r'if\s+(.+?)\s+then\s+(.+)', command, re.IGNORECASE)
+        if if_match:
+            condition = if_match.group(1)
+            action = if_match.group(2)
+            if self.evaluate_condition(condition):
+                await self.execute_command(action)
+            return
+        
+        # Handle SET statements: set $varname = value
+        set_match = re.match(r'set\s+\$(\w+)\s*=\s*(.+)', command, re.IGNORECASE)
+        if set_match:
+            var_name = set_match.group(1)
+            value = self.expand_variables(set_match.group(2))
+            self.set_variable(var_name, value)
+            self.parent.insert_html(f"<span style='color:#888'>Set ${var_name} = {value}</span><br>")
+            return
+        
+        # Handle WAIT statements: wait 3
+        wait_match = re.match(r'wait\s+(\d+(?:\.\d+)?)', command, re.IGNORECASE)
+        if wait_match:
+            seconds = float(wait_match.group(1))
+            await asyncio.sleep(seconds)
+            return
+        
+        # Handle ECHO statements: echo message
+        echo_match = re.match(r'echo\s+(.+)', command, re.IGNORECASE)
+        if echo_match:
+            message = self.expand_variables(echo_match.group(1))
+            self.parent.insert_html(f"<span style='color:#ffaa00'>[Echo: {message}]</span><br>")
+            return
+        
+        # Handle CALL statements: call sequence_name
+        call_match = re.match(r'call\s+(\w+)', command, re.IGNORECASE)
+        if call_match:
+            seq_name = call_match.group(1)
+            await self.execute_sequence(seq_name)
+            return
+        
+        # Regular command - expand variables and send
+        expanded = self.expand_variables(command)
+        self.parent.telnet.send(expanded)
+    
+    async def execute_sequence(self, sequence_name):
+        """Execute a named sequence of commands"""
+        if sequence_name not in self.sequences:
+            self.parent.insert_html(f"<span style='color:#ff5555'>Sequence '{sequence_name}' not found</span><br>")
+            return
+        
+        sequence = self.sequences[sequence_name]
+        commands = sequence['commands']
+        
+        self.parent.insert_html(f"<span style='color:#00ff00'>[Executing: {sequence_name}]</span><br>")
+        
+        for cmd in commands:
+            await self.execute_command(cmd)
+    
+    async def execute_script(self, script_text):
+        """Execute multiple commands from a script string"""
+        lines = script_text.split('\n')
+        for line in lines:
+            await self.execute_command(line)
+
+
+class CollapsiblePanel(QWidget):
+    """A collapsible panel widget with toggle button"""
+    def __init__(self, title, parent=None):
+        super().__init__(parent)
+        self.is_collapsed = False
+        
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(2)
+        
+        # Header with toggle button
+        header = QHBoxLayout()
+        self.toggle_btn = QPushButton("▼")
+        self.toggle_btn.setMaximumWidth(30)
+        self.toggle_btn.setStyleSheet("""
+            QPushButton {
+                background: #2a2a2a;
+                color: #ffffff;
+                border: 1px solid #444;
+                border-radius: 3px;
+                font-weight: bold;
+                padding: 2px;
+            }
+            QPushButton:hover {
+                background: #3a3a3a;
+            }
+        """)
+        self.toggle_btn.clicked.connect(self.toggle)
+        
+        self.title_label = QLabel(f"<b>{title}</b>")
+        self.title_label.setStyleSheet("color: #fff; padding: 4px;")
+        
+        header.addWidget(self.toggle_btn)
+        header.addWidget(self.title_label, 1)
+        layout.addLayout(header)
+        
+        # Content area
+        self.content_widget = QWidget()
+        self.content_layout = QVBoxLayout(self.content_widget)
+        self.content_layout.setContentsMargins(0, 0, 0, 0)
+        layout.addWidget(self.content_widget)
+    
+    def toggle(self):
+        self.is_collapsed = not self.is_collapsed
+        self.content_widget.setVisible(not self.is_collapsed)
+        self.toggle_btn.setText("▶" if self.is_collapsed else "▼")
+    
+    def add_widget(self, widget):
+        self.content_layout.addWidget(widget)
+
+class SmartTextBrowser(QTextBrowser):
+    """A text browser that only auto-scrolls if the scrollbar is already at the bottom."""
+    
+    def append(self, text):
+        scrollbar = self.verticalScrollBar()
+        
+        # Check if the user is currently at the bottom of the chat
+        # We give a 10-pixel buffer to account for minor layout differences
+        was_at_bottom = scrollbar.value() >= (scrollbar.maximum() - 15)
+        
+        # Save current position just in case
+        old_value = scrollbar.value()
+        
+        # Add the text (this usually forces a scroll to bottom)
+        super().append(text)
+        
+        # If we weren't at the bottom before, force us back to where we were
+        if not was_at_bottom:
+            scrollbar.setValue(old_value)
+        else:
+            # Otherwise, ensure we scroll to the new bottom
+            scrollbar.setValue(scrollbar.maximum())
+            
+class VariablesDialog(QDialog):
+    """Dialog for viewing and managing variables"""
+    def __init__(self, script_engine, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Script Variables")
+        self.setModal(True)
+        self.resize(500, 400)
+        self.script_engine = script_engine
+        
+        layout = QVBoxLayout(self)
+        
+        # Info
+        info = QLabel("User variables (prefix with $ in scripts)")
+        layout.addWidget(info)
+        
+        # Variable list
+        self.var_list = QListWidget()
+        self.update_var_list()
+        layout.addWidget(self.var_list)
+        
+        # Buttons
+        btn_layout = QHBoxLayout()
+        add_btn = QPushButton("Add")
+        add_btn.clicked.connect(self.add_variable)
+        edit_btn = QPushButton("Edit")
+        edit_btn.clicked.connect(self.edit_variable)
+        remove_btn = QPushButton("Remove")
+        remove_btn.clicked.connect(self.remove_variable)
+        refresh_btn = QPushButton("Refresh")
+        refresh_btn.clicked.connect(self.update_var_list)
+        
+        btn_layout.addWidget(add_btn)
+        btn_layout.addWidget(edit_btn)
+        btn_layout.addWidget(remove_btn)
+        btn_layout.addWidget(refresh_btn)
+        btn_layout.addStretch()
+        layout.addLayout(btn_layout)
+        
+        # Game state info
+        game_state = QLabel("Game state variables (prefix with @ in scripts):\n"
+                           "@hp, @hp_max, @fatigue, @fatigue_max, @carry")
+        game_state.setWordWrap(True)
+        game_state.setStyleSheet("color: #888; font-size: 9pt; padding: 5px;")
+        layout.addWidget(game_state)
+        
+        # Close button
+        close_btn = QPushButton("Close")
+        close_btn.clicked.connect(self.accept)
+        layout.addWidget(close_btn)
+        
+        self.setStyleSheet("""
+            QDialog {background: #1e1e1e; color: #d4d4d4;}
+            QLabel {color: #d4d4d4;}
+            QListWidget {background: #0d0d0d; color: #d4d4d4;}
+            QPushButton {
+                background: #2a2a2a;
+                color: #ffffff;
+                border: 1px solid #444;
+                padding: 5px 15px;
+                border-radius: 3px;
+            }
+            QPushButton:hover {background: #3a3a3a;}
+        """)
+    
+    def update_var_list(self):
+        self.var_list.clear()
+        for name, value in sorted(self.script_engine.variables.items()):
+            self.var_list.addItem(f"${name} = {value}")
+    
+    def add_variable(self):
+        name, ok1 = QInputDialog.getText(self, "Add Variable", "Variable name:")
+        if ok1 and name:
+            value, ok2 = QInputDialog.getText(self, "Add Variable", f"Value for '${name}':")
+            if ok2:
+                self.script_engine.set_variable(name, value)
+                self.update_var_list()
+    
+    def edit_variable(self):
+        current = self.var_list.currentItem()
+        if current:
+            name = current.text().split(" = ")[0].lstrip('$')
+            value, ok = QInputDialog.getText(self, "Edit Variable", 
+                                            f"Value for '${name}':",
+                                            text=self.script_engine.get_variable(name))
+            if ok:
+                self.script_engine.set_variable(name, value)
+                self.update_var_list()
+    
+    def remove_variable(self):
+        current = self.var_list.currentItem()
+        if current:
+            name = current.text().split(" = ")[0].lstrip('$')
+            if name in self.script_engine.variables:
+                del self.script_engine.variables[name]
+                self.update_var_list()
+
+
+class SequenceDialog(QDialog):
+    """Dialog for managing command sequences"""
+    def __init__(self, sequences, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Manage Sequences")
+        self.setModal(True)
+        self.resize(700, 500)
+        self.sequences = sequences.copy()
+        
+        layout = QVBoxLayout(self)
+        
+        # Info
+        info = QLabel("Sequences are multi-line scripts that can be called from aliases/triggers.\n"
+                     "Use 'call sequence_name' to execute. Supports: if/then, set, wait, echo, call")
+        info.setWordWrap(True)
+        layout.addWidget(info)
+        
+        # Sequence list
+        self.seq_list = QListWidget()
+        self.update_seq_list()
+        layout.addWidget(self.seq_list)
+        
+        # Buttons
+        btn_layout = QHBoxLayout()
+        add_btn = QPushButton("Add")
+        add_btn.clicked.connect(self.add_sequence)
+        edit_btn = QPushButton("Edit")
+        edit_btn.clicked.connect(self.edit_sequence)
+        remove_btn = QPushButton("Remove")
+        remove_btn.clicked.connect(self.remove_sequence)
+        
+        btn_layout.addWidget(add_btn)
+        btn_layout.addWidget(edit_btn)
+        btn_layout.addWidget(remove_btn)
+        btn_layout.addStretch()
+        layout.addLayout(btn_layout)
+        
+        # Dialog buttons
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+        
+        self.setStyleSheet("""
+            QDialog {background: #1e1e1e; color: #d4d4d4;}
+            QLabel {color: #d4d4d4;}
+            QListWidget {background: #0d0d0d; color: #d4d4d4;}
+            QPushButton {
+                background: #2a2a2a;
+                color: #ffffff;
+                border: 1px solid #444;
+                padding: 5px 15px;
+                border-radius: 3px;
+            }
+            QPushButton:hover {background: #3a3a3a;}
+        """)
+    
+    def update_seq_list(self):
+        self.seq_list.clear()
+        for name, seq in sorted(self.sequences.items()):
+            cmd_count = len(seq['commands'])
+            self.seq_list.addItem(f"{name} ({cmd_count} commands)")
+    
+    def add_sequence(self):
+        name, ok1 = QInputDialog.getText(self, "Add Sequence", "Sequence name:")
+        if ok1 and name:
+            self.edit_sequence_content(name, [])
+    
+    def edit_sequence(self):
+        current = self.seq_list.currentItem()
+        if current:
+            name = current.text().split(" (")[0]
+            commands = self.sequences[name]['commands']
+            self.edit_sequence_content(name, commands)
+    
+    def edit_sequence_content(self, name, existing_commands):
+        dialog = QDialog(self)
+        dialog.setWindowTitle(f"Edit Sequence: {name}")
+        dialog.resize(600, 400)
+        
+        layout = QVBoxLayout(dialog)
+        
+        label = QLabel("Enter commands (one per line):\n"
+                      "Examples: north, wait 2, if @hp < 50 then drink potion, set $target = orc")
+        label.setWordWrap(True)
+        layout.addWidget(label)
+        
+        text_edit = QPlainTextEdit()
+        text_edit.setPlainText('\n'.join(existing_commands))
+        text_edit.setStyleSheet("background: #0d0d0d; color: #d4d4d4; font-family: Consolas;")
+        layout.addWidget(text_edit)
+        
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        layout.addWidget(buttons)
+        
+        dialog.setStyleSheet("""
+            QDialog {background: #1e1e1e; color: #d4d4d4;}
+            QLabel {color: #d4d4d4;}
+        """)
+        
+        if dialog.exec() == QDialog.Accepted:
+            commands = [line.strip() for line in text_edit.toPlainText().split('\n') if line.strip()]
+            self.sequences[name] = {'commands': commands}
+            self.update_seq_list()
+    
+    def remove_sequence(self):
+        current = self.seq_list.currentItem()
+        if current:
+            name = current.text().split(" (")[0]
+            del self.sequences[name]
+            self.update_seq_list()
+
+
+class AliasDialog(QDialog):
+    """Dialog for managing aliases"""
+    def __init__(self, aliases, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Manage Aliases")
+        self.setModal(True)
+        self.resize(600, 450)
+        self.aliases = aliases.copy()
+        
+        layout = QVBoxLayout(self)
+        
+        # Info label
+        info = QLabel("Aliases support variables ($var, @hp), multi-commands (cmd1;cmd2), "
+                     "conditionals (if @hp < 50 then...), and sequences (call seq_name)")
+        info.setWordWrap(True)
+        layout.addWidget(info)
+        
+        # Alias list
+        self.alias_list = QListWidget()
+        self.update_alias_list()
+        layout.addWidget(self.alias_list)
+        
+        # Add/Edit/Remove buttons
+        btn_layout = QHBoxLayout()
+        add_btn = QPushButton("Add")
+        add_btn.clicked.connect(self.add_alias)
+        edit_btn = QPushButton("Edit")
+        edit_btn.clicked.connect(self.edit_alias)
+        remove_btn = QPushButton("Remove")
+        remove_btn.clicked.connect(self.remove_alias)
+        
+        btn_layout.addWidget(add_btn)
+        btn_layout.addWidget(edit_btn)
+        btn_layout.addWidget(remove_btn)
+        btn_layout.addStretch()
+        layout.addLayout(btn_layout)
+        
+        # Dialog buttons
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+        
+        self.setStyleSheet("""
+            QDialog {background: #1e1e1e; color: #d4d4d4;}
+            QLabel {color: #d4d4d4;}
+            QListWidget {background: #0d0d0d; color: #d4d4d4;}
+            QPushButton {
+                background: #2a2a2a;
+                color: #ffffff;
+                border: 1px solid #444;
+                padding: 5px 15px;
+                border-radius: 3px;
+            }
+            QPushButton:hover {background: #3a3a3a;}
+        """)
+    
+    def update_alias_list(self):
+        self.alias_list.clear()
+        for alias, command in sorted(self.aliases.items()):
+            display = command if len(command) < 60 else command[:57] + "..."
+            self.alias_list.addItem(f"{alias} → {display}")
+    
+    def add_alias(self):
+        alias, ok1 = QInputDialog.getText(self, "Add Alias", "Alias shortcut:")
+        if ok1 and alias:
+            command, ok2 = QInputDialog.getText(self, "Add Alias", 
+                                                f"Command for '{alias}':\n(use ; to separate multiple commands)")
+            if ok2 and command:
+                self.aliases[alias] = command
+                self.update_alias_list()
+    
+    def edit_alias(self):
+        current = self.alias_list.currentItem()
+        if current:
+            alias = current.text().split(" → ")[0]
+            command, ok = QInputDialog.getText(self, "Edit Alias", 
+                                               f"Command for '{alias}':", 
+                                               text=self.aliases[alias])
+            if ok:
+                self.aliases[alias] = command
+                self.update_alias_list()
+    
+    def remove_alias(self):
+        current = self.alias_list.currentItem()
+        if current:
+            alias = current.text().split(" → ")[0]
+            del self.aliases[alias]
+            self.update_alias_list()
+
+
+class TriggerDialog(QDialog):
+    """Dialog for managing triggers"""
+    def __init__(self, triggers, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Manage Triggers")
+        self.setModal(True)
+        self.resize(700, 500)
+        self.triggers = [t.copy() for t in triggers]
+        
+        layout = QVBoxLayout(self)
+        
+        # Info label
+        info = QLabel("Triggers support regex patterns, variables ($1-$9 for captures), "
+                     "multi-commands (;), conditionals, and sequences (call seq_name)")
+        info.setWordWrap(True)
+        layout.addWidget(info)
+        
+        # Trigger list
+        self.trigger_list = QListWidget()
+        self.update_trigger_list()
+        layout.addWidget(self.trigger_list)
+        
+        # Add/Edit/Remove/Toggle buttons
+        btn_layout = QHBoxLayout()
+        add_btn = QPushButton("Add")
+        add_btn.clicked.connect(self.add_trigger)
+        edit_btn = QPushButton("Edit")
+        edit_btn.clicked.connect(self.edit_trigger)
+        toggle_btn = QPushButton("Enable/Disable")
+        toggle_btn.clicked.connect(self.toggle_trigger)
+        remove_btn = QPushButton("Remove")
+        remove_btn.clicked.connect(self.remove_trigger)
+        
+        btn_layout.addWidget(add_btn)
+        btn_layout.addWidget(edit_btn)
+        btn_layout.addWidget(toggle_btn)
+        btn_layout.addWidget(remove_btn)
+        btn_layout.addStretch()
+        layout.addLayout(btn_layout)
+        
+        # Dialog buttons
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+        
+        self.setStyleSheet("""
+            QDialog {background: #1e1e1e; color: #d4d4d4;}
+            QLabel {color: #d4d4d4;}
+            QListWidget {background: #0d0d0d; color: #d4d4d4;}
+            QPushButton {
+                background: #2a2a2a;
+                color: #ffffff;
+                border: 1px solid #444;
+                padding: 5px 15px;
+                border-radius: 3px;
+            }
+            QPushButton:hover {background: #3a3a3a;}
+        """)
+    
+    def update_trigger_list(self):
+        self.trigger_list.clear()
+        for trigger in self.triggers:
+            enabled = "✓" if trigger['enabled'] else "✗"
+            action_display = trigger['action'] if len(trigger['action']) < 40 else trigger['action'][:37] + "..."
+            self.trigger_list.addItem(f"{enabled} {trigger['pattern']} → {action_display}")
+    
+    def add_trigger(self):
+        pattern, ok1 = QInputDialog.getText(self, "Add Trigger", "Pattern (regex):")
+        if ok1 and pattern:
+            action, ok2 = QInputDialog.getText(self, "Add Trigger", 
+                                              f"Action for pattern '{pattern}':\n(use $1-$9 for captures)")
+            if ok2 and action:
+                self.triggers.append({
+                    'pattern': pattern,
+                    'action': action,
+                    'enabled': True
+                })
+                self.update_trigger_list()
+    
+    def edit_trigger(self):
+        idx = self.trigger_list.currentRow()
+        if idx >= 0:
+            trigger = self.triggers[idx]
+            pattern, ok1 = QInputDialog.getText(self, "Edit Trigger", "Pattern:", text=trigger['pattern'])
+            if ok1:
+                action, ok2 = QInputDialog.getText(self, "Edit Trigger", "Action:", text=trigger['action'])
+                if ok2:
+                    trigger['pattern'] = pattern
+                    trigger['action'] = action
+                    self.update_trigger_list()
+    
+    def toggle_trigger(self):
+        idx = self.trigger_list.currentRow()
+        if idx >= 0:
+            self.triggers[idx]['enabled'] = not self.triggers[idx]['enabled']
+            self.update_trigger_list()
+    
+    def remove_trigger(self):
+        idx = self.trigger_list.currentRow()
+        if idx >= 0:
+            del self.triggers[idx]
+            self.update_trigger_list()
+
+
+class TelnetClient(QObject):
+    received = Signal(str)
+    connected = Signal()
+    disconnected = Signal()
+
+    def __init__(self, host="127.0.0.1", port=65432):
+        super().__init__()
+        self.host = host
+        self.port = port
+        self.reader = None
+        self.writer = None
+
+    async def connect(self):
+        try:
+            self.reader, self.writer = await asyncio.open_connection(self.host, self.port)
+            self.connected.emit()
+            asyncio.create_task(self._reader_loop())
+        except Exception as e:
+            print("Connection failed:", e)
+            self.disconnected.emit()
+
+    async def _reader_loop(self):
+        buffer = b""
+        try:
+            while True:
+                try:
+                    data = await asyncio.wait_for(self.reader.read(4096), timeout=0.5)
+                    if not data:
+                        break
+                    buffer += data
+                except asyncio.TimeoutError:
+                    if buffer:
+                        decoded = buffer.decode('utf-8', errors='replace')
+                        if not decoded.endswith(('\r\n', '\n')):
+                            self.received.emit(decoded)
+                            buffer = b""
+                    continue
+
+                while b'\r\n' in buffer:
+                    line, buffer = buffer.split(b'\r\n', 1)
+                    text = line.decode('utf-8', errors='replace') + '\r\n'
+                    self.received.emit(text)
+
+                while b'\n' in buffer and b'\r\n' not in buffer:
+                    line, buffer = buffer.split(b'\n', 1)
+                    text = line.decode('utf-8', errors='replace') + '\n'
+                    self.received.emit(text)
+
+        except Exception as e:
+            print("Read error:", e)
+        finally:
+            if buffer:
+                try:
+                    self.received.emit(buffer.decode('utf-8', errors='replace'))
+                except:
+                    pass
+            self.disconnected.emit()
+
+    def send(self, text: str):
+        if self.writer and not self.writer.is_closing():
+            self.writer.write((text + '\r\n').encode('utf-8'))
+            asyncio.create_task(self.writer.drain())
+
+    def close(self):
+        if self.writer:
+            self.writer.close()
+
+
+class ConnectionDialog(QDialog):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("Connect to Dragon's Gate")
+        self.setModal(True)
+        self.resize(380, 200)
+        
+        self.settings = QSettings("MySoft", "DragonsGateClient")
+
+        layout = QVBoxLayout(self)
+        form = QFormLayout()
+
+        self.host_combo = QComboBox()
+        self.host_combo.setEditable(True)
+        self.host_combo.addItems(self.settings.value("recent_hosts", ["127.0.0.1", "dg.mudrealm.com"]))
+        form.addRow("Host:", self.host_combo)
+
+        self.port_edit = QLineEdit("4000")
+        form.addRow("Port:", self.port_edit)
+
+        self.auto_connect = QCheckBox("Auto-connect on startup")
+        self.auto_connect.setChecked(self.settings.value("auto_connect", True, bool))
+        form.addRow(self.auto_connect)
+
+        layout.addLayout(form)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+        last_host = self.settings.value("last_host", "127.0.0.1")
+        last_port = self.settings.value("last_port", "4000", int)
+        index = self.host_combo.findText(last_host)
+        if index >= 0:
+            self.host_combo.setCurrentIndex(index)
+        else:
+            self.host_combo.setCurrentText(last_host)
+        self.port_edit.setText(str(last_port))
+
+    def accept(self):
+        host = self.host_combo.currentText().strip()
+        port_text = self.port_edit.text().strip()
+        if not host or not port_text.isdigit():
+            QMessageBox.warning(self, "Invalid", "Please enter a valid host and port.")
+            return
+
+        recent = self.settings.value("recent_hosts", [])
+        if host not in recent:
+            recent.insert(0, host)
+            recent = recent[:10]
+            self.settings.setValue("recent_hosts", recent)
+
+        self.settings.setValue("last_host", host)
+        self.settings.setValue("last_port", int(port_text))
+        self.settings.setValue("auto_connect", self.auto_connect.isChecked())
+        self.settings.sync()
+
+        self.host = host
+        self.port = int(port_text)
+        super().accept()
+
+
+class MudWindow(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("Dragon's Gate – Modern Client")
+        self.resize(1400, 800)
+
+        self.telnet = TelnetClient()
+        self.telnet.received.connect(self.on_text)
+        self.telnet.connected.connect(self.on_connected)
+        self.telnet.disconnected.connect(self.on_disconnected)
+
+        # Initialize script engine
+        self.script_engine = ScriptEngine(self)
+
+        self.setup_ui()
+        self.command_history = []
+        self.history_index = -1
+        self.hp = self.hp_max = self.fatigue = self.fatigue_max = 0
+        self.carry = 0
+        self.race = "Adventurer"
+        self.expecting_inventory = False
+        self.inventory_lines = []
+        self.expecting_equipment = False
+        self.equipment_lines = []
+        self.expecting_skills = False
+        self.skill_lines = []
+
+        # Load aliases and triggers
+        self.settings = QSettings("MySoft", "DragonsGateClient")
+        self.load_aliases_triggers()
+
+    def load_aliases_triggers(self):
+        """Load aliases, triggers, sequences, and variables from settings"""
+        # Default aliases
+        default_aliases = {
+            'gg': 'get gold',
+            'ga': 'get all',
+            'k': 'kill $1',
+            'n': 'north',
+            's': 'south',
+            'e': 'east',
+            'w': 'west',
+            'heal': 'if @hp < @hp_max then cast heal',
+        }
+        
+        aliases_json = self.settings.value("aliases", "")
+        if aliases_json:
+            try:
+                self.aliases = json.loads(aliases_json)
+            except:
+                self.aliases = default_aliases
+        else:
+            self.aliases = default_aliases
+        
+        # Default triggers
+        default_triggers = [
+            {'pattern': r'(.*) attacks you', 'action': 'set $attacker = $1;kill $attacker', 'enabled': False},
+            {'pattern': r'You are hungry', 'action': 'eat bread', 'enabled': False},
+            {'pattern': r'low on health', 'action': 'if @hp < 30 then flee', 'enabled': False},
+        ]
+        
+        triggers_json = self.settings.value("triggers", "")
+        if triggers_json:
+            try:
+                self.triggers = json.loads(triggers_json)
+            except:
+                self.triggers = default_triggers
+        else:
+            self.triggers = default_triggers
+        
+        # Load sequences
+        sequences_json = self.settings.value("sequences", "")
+        if sequences_json:
+            try:
+                self.script_engine.sequences = json.loads(sequences_json)
+            except:
+                self.script_engine.sequences = {}
+        
+        # Load variables
+        variables_json = self.settings.value("variables", "")
+        if variables_json:
+            try:
+                self.script_engine.variables = json.loads(variables_json)
+            except:
+                self.script_engine.variables = {}
+
+    def save_aliases_triggers(self):
+        """Save aliases, triggers, sequences, and variables to settings"""
+        self.settings.setValue("aliases", json.dumps(self.aliases))
+        self.settings.setValue("triggers", json.dumps(self.triggers))
+        self.settings.setValue("sequences", json.dumps(self.script_engine.sequences))
+        self.settings.setValue("variables", json.dumps(self.script_engine.variables))
+        self.settings.sync()
+
+    def open_alias_manager(self):
+        dialog = AliasDialog(self.aliases, self)
+        if dialog.exec() == QDialog.Accepted:
+            self.aliases = dialog.aliases
+            self.save_aliases_triggers()
+            self.statusBar().showMessage("Aliases updated", 3000)
+
+    def open_trigger_manager(self):
+        dialog = TriggerDialog(self.triggers, self)
+        if dialog.exec() == QDialog.Accepted:
+            self.triggers = dialog.triggers
+            self.save_aliases_triggers()
+            self.statusBar().showMessage("Triggers updated", 3000)
+    
+    def open_sequence_manager(self):
+        dialog = SequenceDialog(self.script_engine.sequences, self)
+        if dialog.exec() == QDialog.Accepted:
+            self.script_engine.sequences = dialog.sequences
+            self.save_aliases_triggers()
+            self.statusBar().showMessage("Sequences updated", 3000)
+    
+    def open_variable_manager(self):
+        dialog = VariablesDialog(self.script_engine, self)
+        dialog.exec()
+        self.save_aliases_triggers()
+
+    async def process_aliases(self, command):
+        """Expand aliases in command and execute"""
+        words = command.split()
+        if words and words[0] in self.aliases:
+            # Get alias expansion
+            expanded = self.aliases[words[0]]
+            
+            # Replace $1, $2, etc. with arguments
+            for i, arg in enumerate(words[1:], 1):
+                expanded = expanded.replace(f'${i}', arg)
+            
+            # Check for multi-command (semicolon separated)
+            if ';' in expanded:
+                commands = [cmd.strip() for cmd in expanded.split(';')]
+                for cmd in commands:
+                    await self.script_engine.execute_command(cmd)
+                return True
+            else:
+                await self.script_engine.execute_command(expanded)
+                return True
+        return False
+
+    async def process_triggers(self, line):
+        """Check triggers and execute actions"""
+        for trigger in self.triggers:
+            if not trigger.get('enabled', True):
+                continue
+            
+            try:
+                pattern = re.compile(trigger['pattern'], re.IGNORECASE)
+                match = pattern.search(line)
+                if match:
+                    action = trigger['action']
+                    
+                    # Replace $1, $2, etc. with capture groups
+                    for i, group in enumerate(match.groups(), 1):
+                        action = action.replace(f'${i}', group)
+                    
+                    # Check for multi-command
+                    if ';' in action:
+                        commands = [cmd.strip() for cmd in action.split(';')]
+                        for cmd in commands:
+                            await self.script_engine.execute_command(cmd)
+                    else:
+                        await self.script_engine.execute_command(action)
+                    
+                    self.insert_html(f"<span style='color:#ffaa00'>[Trigger: {trigger['pattern'][:30]}...]</span><br>")
+            except re.error:
+                pass  # Invalid regex, skip
+
+    def setup_ui(self):
+        central = QWidget()
+        self.setCentralWidget(central)
+        main_layout = QHBoxLayout(central)
+
+        # === LEFT PANEL (Collapsible) ===
+        self.left_panel = QWidget()
+        self.left_panel.setMaximumWidth(300)
+        self.left_panel.setMinimumWidth(250)
+        left_layout = QVBoxLayout(self.left_panel)
+        left_layout.setContentsMargins(5, 5, 5, 5)
+
+        # Stats Panel
+        stats_panel = CollapsiblePanel("Character Stats")
+        self.hp_bar = QProgressBar()
+        self.hp_bar.setStyleSheet("QProgressBar::chunk {background: qlineargradient(x1:0,y1:0,x2:1,y2:0, stop:0 #00ff00, stop:0.5 #ffff00, stop:1 #ff0000);}")
+        self.fatigue_bar = QProgressBar()
+        self.fatigue_bar.setStyleSheet("QProgressBar::chunk {background: #4488ff;}")
+        self.carry_bar = QProgressBar()
+        self.carry_bar.setMaximum(100)
+        self.carry_bar.setStyleSheet("QProgressBar::chunk {background: #ffaa00;}")
+        
+        bars_widget = QWidget()
+        bars = QFormLayout(bars_widget)
+        bars.addRow("HP:", self.hp_bar)
+        bars.addRow("Fatigue:", self.fatigue_bar)
+        bars.addRow("Carry:", self.carry_bar)
+        stats_panel.add_widget(bars_widget)
+        left_layout.addWidget(stats_panel)
+
+        # Skills Panel
+        skills_panel = CollapsiblePanel("Skills")
+        self.skills_list = QListWidget()
+        self.skills_list.setStyleSheet("background: #1a1a1a; color: #d4d4d4;")
+        skills_panel.add_widget(self.skills_list)
+        left_layout.addWidget(skills_panel)
+
+        # Inventory Panel
+        inventory_panel = CollapsiblePanel("Inventory")
+        self.inventory = QListWidget()
+        self.inventory.setStyleSheet("background: #1a1a1a; color: #d4d4d4;")
+        self.inventory.itemClicked.connect(lambda i: self.telnet.send(f"look {i.text()}"))
+        inventory_panel.add_widget(self.inventory)
+        left_layout.addWidget(inventory_panel)
+
+        # Equipment Panel
+        equipment_panel = CollapsiblePanel("Equipment")
+        self.equipment = QListWidget()
+        self.equipment.setStyleSheet("background: #1a1a1a; color: #d4d4d4;")
+        self.equipment.itemClicked.connect(lambda i: self.telnet.send(f"inspect {i.text().split(':')[-1].strip()}"))
+        equipment_panel.add_widget(self.equipment)
+        left_layout.addWidget(equipment_panel)
+
+        left_layout.addStretch()
+
+        # === CENTER (Main Output) ===
+        center = QVBoxLayout()
+        self.output = QTextBrowser()
+        self.output.setOpenExternalLinks(False)
+        self.output.setStyleSheet("""
+            background:#0d0d0d; 
+            color:#d4d4d4; 
+            font-family: Consolas; 
+            font-size: 11pt;
+            p { margin: 0px; padding: 0px; line-height: 1.0; }
+        """)
+        center.addWidget(self.output, 1)
+
+        inp = QHBoxLayout()
+        self.input = QLineEdit()
+        self.input.returnPressed.connect(self.send_command)
+        inp.addWidget(QLabel("Command:"))
+        inp.addWidget(self.input)
+        center.addLayout(inp)
+
+        # === RIGHT PANEL (Collapsible) ===
+        self.right_panel = QWidget()
+        self.right_panel.setMaximumWidth(350)
+        self.right_panel.setMinimumWidth(280)
+        right_layout = QVBoxLayout(self.right_panel)
+        right_layout.setContentsMargins(5, 5, 5, 5)
+
+        # Conversation Panel
+        conversation_panel = CollapsiblePanel("Conversation")
+        self.conversation = SmartTextBrowser()  # <--- New Class
+        self.conversation.setStyleSheet("background:#1a2a1a; color:#90ee90; font-size: 10pt;")
+        conversation_panel.add_widget(self.conversation)
+        right_layout.addWidget(conversation_panel, 2)
+
+        # Race Thought Panel
+        race_panel = CollapsiblePanel("Race Link / Telepathy")
+        self.race_thought = SmartTextBrowser()  # <--- New Class
+        self.race_thought.setStyleSheet("background:#2d1b3a; color:#e0bbe0; font-size: 10pt;")
+        race_panel.add_widget(self.race_thought)
+        right_layout.addWidget(race_panel, 1)
+
+        # === SPLITTER SETUP ===
+        self.main_splitter = QSplitter(Qt.Horizontal)
+        
+        center_widget = QWidget()
+        center_widget.setLayout(center)
+        
+        self.main_splitter.addWidget(self.left_panel)
+        self.main_splitter.addWidget(center_widget)
+        self.main_splitter.addWidget(self.right_panel)
+        self.main_splitter.setSizes([280, 700, 320])
+        
+        main_layout.addWidget(self.main_splitter)
+
+        # === MENU BAR ===
+        menubar = self.menuBar()
+        
+        # View Menu
+        view_menu = menubar.addMenu("View")
+        toggle_left = QAction("Toggle Left Panel", self)
+        toggle_left.setShortcut("Ctrl+L")
+        toggle_left.triggered.connect(lambda: self.left_panel.setVisible(not self.left_panel.isVisible()))
+        view_menu.addAction(toggle_left)
+        
+        toggle_right = QAction("Toggle Right Panel", self)
+        toggle_right.setShortcut("Ctrl+R")
+        toggle_right.triggered.connect(lambda: self.right_panel.setVisible(not self.right_panel.isVisible()))
+        view_menu.addAction(toggle_right)
+        
+        # Automation Menu
+        automation_menu = menubar.addMenu("Automation")
+        
+        manage_aliases = QAction("Manage Aliases...", self)
+        manage_aliases.setShortcut("Ctrl+A")
+        manage_aliases.triggered.connect(self.open_alias_manager)
+        automation_menu.addAction(manage_aliases)
+        
+        manage_triggers = QAction("Manage Triggers...", self)
+        manage_triggers.setShortcut("Ctrl+T")
+        manage_triggers.triggered.connect(self.open_trigger_manager)
+        automation_menu.addAction(manage_triggers)
+        
+        automation_menu.addSeparator()
+        
+        manage_sequences = QAction("Manage Sequences...", self)
+        manage_sequences.setShortcut("Ctrl+S")
+        manage_sequences.triggered.connect(self.open_sequence_manager)
+        automation_menu.addAction(manage_sequences)
+        
+        manage_variables = QAction("View Variables...", self)
+        manage_variables.setShortcut("Ctrl+V")
+        manage_variables.triggered.connect(self.open_variable_manager)
+        automation_menu.addAction(manage_variables)
+
+        self.setStyleSheet("""
+            QMainWindow {background:#1e1e1e; color:#d4d4d4;} 
+            QLabel {color:#fff; font-weight:bold;} 
+            QToolBar {color: #ffffff;}
+            QMenuBar {background: #2a2a2a; color: #ffffff;}
+            QMenuBar::item:selected {background: #3a3a3a;}
+            QMenu {background: #2a2a2a; color: #ffffff;}
+            QMenu::item:selected {background: #3a3a3a;}
+        """)
+
+    def on_connected(self):
+        self.insert_html("<span style='color:#00ff00'><b>Connected! Mort lights his cigar...</b></span>")
+
+    def on_disconnected(self):
+        self.insert_html("<span style='color:#ff5555'><b>Disconnected – click Reconnect</b></span>")
+
+    def on_text(self, raw_line: str):
+        line = raw_line.rstrip()
+        stripped_line = line.strip()
+
+        # Skip server prompts
+        # FIXED
+        if re.match(r'^\[\w+\]>', stripped_line):
+            return
+
+        html = ansi_to_html(raw_line)
+
+        # Process triggers asynchronously
+        asyncio.create_task(self.process_triggers(line))
+
+        # === CONVERSATION CAPTURE ===
+        if (re.search(r'\bwhispers?\b|\bsays?\b|\bshouts?\b|\btells?\b', line, re.IGNORECASE) or
+            " says:" in line or " whispers:" in line or " shouts:" in line or " tells you:" in line):
+            self.conversation.append(f"<span style='color:#90ee90;'>{html}</span>")
+
+        # === RACE THOUGHT / TELEPATHY ===
+        if ("[Dragon Link]" in raw_line or 
+            "[Secian Link]" in raw_line or 
+            " sends a thought:" in raw_line):
+            self.race_thought.append(f"<span style='color:#ff77ff; font-style:italic;'>{html}</span>")
+            return
+
+        # === CHARACTER SHEET PARSING ===
+        if "Hit Points :" in raw_line:
+            hp_match = re.search(r"Hit Points\s*:\s*(\d+)\((\d+)\)", raw_line)
+            fat_match = re.search(r"Fatigue\s*:\s*(\d+)\((\d+)\)", raw_line)
+            carry_match = re.search(r"Carrying\s*:\s*(\d+)", raw_line)
+            race_match = re.search(r"You are a .*? (\w+)\.", raw_line)
+
+            if hp_match:
+                self.hp = int(hp_match.group(1))
+                self.hp_max = int(hp_match.group(2))
+                self.hp_bar.setMaximum(self.hp_max)
+                self.hp_bar.setValue(self.hp)
+
+            if fat_match:
+                self.fatigue = int(fat_match.group(1))
+                self.fatigue_max = int(fat_match.group(2))
+                self.fatigue_bar.setMaximum(self.fatigue_max)
+                self.fatigue_bar.setValue(self.fatigue)
+
+            if carry_match:
+                self.carry = int(carry_match.group(1))
+                self.carry_bar.setValue(min(100, self.carry // 3))
+
+            if race_match:
+                self.race = race_match.group(1)
+                self.setWindowTitle(f"{self.race} – Dragon's Gate")
+
+        # === SKILLS PARSING ===
+        if "Your skills:" in line or "Skills:" in line:
+            self.skills_list.clear()
+            self.expecting_skills = True
+            self.skill_lines = []
+
+        elif self.expecting_skills:
+            if not stripped_line or not line.startswith("  "):
+                self.expecting_skills = False
+                for skill_line in self.skill_lines:
+                    skill_line = skill_line.lstrip().strip()
+                    if skill_line and skill_line != "(none)":
+                        self.skills_list.addItem(skill_line)
+            else:
+                self.skill_lines.append(line)
+
+        # === INVENTORY UPDATE ===
+        if "You are carrying:" in line:
+            self.inventory.clear()
+            self.expecting_inventory = True
+            self.inventory_lines = []
+
+        elif self.expecting_inventory:
+            if stripped_line.startswith("Carrying:") or not stripped_line or not line.startswith("  "):
+                self.expecting_inventory = False
+                items = [l.lstrip().strip() for l in self.inventory_lines if l.strip() and l.strip() != "(nothing)"]
+                for item in items:
+                    self.inventory.addItem(item)
+                
+                if "Carrying:" in line:
+                    carry_match = re.search(r"Carrying:\s*(\d+)\s*/\s*(\d+)\s*lbs", line)
+                    if carry_match:
+                        current = int(carry_match.group(1))
+                        self.carry = current
+                        self.carry_bar.setValue(min(100, current // 3))
+            else:
+                self.inventory_lines.append(line)
+
+        # === EQUIPMENT UPDATE ===
+        if "You are wearing:" in line:
+            self.equipment.clear()
+            self.expecting_equipment = True
+            self.equipment_lines = []
+
+        elif self.expecting_equipment:
+            if not stripped_line or not line.startswith("  "):
+                self.expecting_equipment = False
+                for eq_line in self.equipment_lines:
+                    eq_line_stripped = eq_line.lstrip().strip()
+                    if ':' in eq_line_stripped:
+                        label, item = eq_line_stripped.split(':', 1)
+                        self.equipment.addItem(f"{label.strip()}: {item.strip()}")
+            else:
+                self.equipment_lines.append(line)
+
+        # === ALL OTHER TEXT ===
+        self.insert_html(html)
+
+    def insert_html(self, html: str):
+        cursor = self.output.textCursor()
+        cursor.movePosition(QTextCursor.End)
+        cursor.insertHtml(html)
+        self.output.setTextCursor(cursor)
+        self.output.ensureCursorVisible()
+
+    def send_command(self):
+        cmd = self.input.text().strip()
+        self.input.clear()
+        
+        # Create async task for command processing
+        asyncio.create_task(self._send_command_async(cmd))
+        
+        self.command_history.append(cmd)
+        self.history_index = len(self.command_history)
+    
+    async def _send_command_async(self, cmd):
+        """Process command with async support for scripting"""
+        # Check for direct script commands
+        if cmd.lower().startswith(('if ', 'set ', 'wait ', 'echo ', 'call ')):
+            await self.script_engine.execute_command(cmd)
+            self.insert_html(f"<span style='color:#888888'>→ {cmd}</span><br>")
+            return
+        
+        # Check for multi-command with semicolons
+        if ';' in cmd:
+            commands = [c.strip() for c in cmd.split(';')]
+            for command in commands:
+                await self.script_engine.execute_command(command)
+            self.insert_html(f"<span style='color:#888888'>→ {cmd}</span><br>")
+            return
+        
+        # Try alias expansion
+        if await self.process_aliases(cmd):
+            self.insert_html(f"<span style='color:#888888'>→ {cmd}</span> <span style='color:#666666'>[alias]</span><br>")
+            return
+        
+        # Regular command - expand variables and send
+        expanded = self.script_engine.expand_variables(cmd)
+        self.telnet.send(expanded)
+        
+        if cmd != expanded:
+            self.insert_html(f"<span style='color:#888888'>→ {cmd}</span> <span style='color:#666666'>[{expanded}]</span><br>")
+        elif cmd:
+            self.insert_html(f"<span style='color:#888888'>→ {cmd}</span><br>")
+        else:
+            self.insert_html("<span style='color:#666666'>→ (Enter)</span><br>")
+
+    def keyPressEvent(self, event):
+        if self.input.hasFocus():
+            if event.key() == Qt.Key_Up and self.history_index > 0:
+                self.history_index -= 1
+                self.input.setText(self.command_history[self.history_index])
+            elif event.key() == Qt.Key_Down:
+                if self.history_index < len(self.command_history)-1:
+                    self.history_index += 1
+                    self.input.setText(self.command_history[self.history_index])
+                else:
+                    self.history_index = len(self.command_history)
+                    self.input.clear()
+        super().keyPressEvent(event)
+
+    def closeEvent(self, event):
+        self.save_aliases_triggers()
+        self.telnet.close()
+        super().closeEvent(event)
+
+
+if __name__ == "__main__":
+    app = QApplication(sys.argv)
+    app.setOrganizationName("MySoft")
+    app.setApplicationName("DragonsGateClient")
+    loop = qasync.QEventLoop(app)
+    asyncio.set_event_loop(loop)
+
+    window = MudWindow()
+    window.show()
+
+    settings = QSettings("MySoft", "DragonsGateClient")
+    auto_connect = settings.value("auto_connect", True, bool)
+
+    async def show_connection_dialog():
+        dialog = ConnectionDialog()
+        if await loop.run_in_executor(None, dialog.exec) == QDialog.Accepted:
+            window.telnet.host = dialog.host
+            window.telnet.port = dialog.port
+            await window.telnet.connect()
+
+    toolbar = window.addToolBar("Connection")
+    toolbar.setStyleSheet("""
+        QToolBar {
+            background: #1e1e1e;
+            color: #ffffff;
+            spacing: 5px;
+            padding: 5px;
+        }
+        QToolButton {
+            color: #ffffff;
+            background: #2a2a2a;
+            border: 1px solid #444;
+            border-radius: 3px;
+            padding: 5px 10px;
+        }
+        QToolButton:hover {
+            background: #3a3a3a;
+        }
+        QToolButton:pressed {
+            background: #4a4a4a;
+        }
+    """)
+
+    connect_action = QAction("Connect…", window)
+    connect_action.triggered.connect(lambda: asyncio.create_task(show_connection_dialog()))
+    toolbar.addAction(connect_action)
+
+    reconnect_action = QAction("Reconnect", window)
+    reconnect_action.triggered.connect(lambda: asyncio.create_task(window.telnet.connect()))
+    toolbar.addAction(reconnect_action)
+
+    disconnect_action = QAction("Disconnect", window)
+    disconnect_action.triggered.connect(lambda: window.telnet.close())
+    toolbar.addAction(disconnect_action)
+
+    if auto_connect:
+        QTimer.singleShot(100, lambda: asyncio.create_task(show_connection_dialog()))
+    else:
+        QTimer.singleShot(100, lambda: asyncio.create_task(show_connection_dialog()))
+
+    with loop:
+        loop.run_forever()
